@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.b3d
+output/
+*.mot
+*.sto
+*.trc
+*.json
+.env
