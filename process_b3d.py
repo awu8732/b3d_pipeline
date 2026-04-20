@@ -43,7 +43,7 @@ from b3d_extract import (
 # CONFIG: edit this block; leave everything else alone
 # ════════════════════════════════════════════════════════════════════════════
 
-B3D_PATH    = "AddBiomechanicsDataset/test/With_Arm/Hammer2013_Formatted_With_Arm/subject10/subject10.b3d"
+B3D_PATH    = "AddBiomechanicsDataset/train/No_Arm/Tan2021_Formatted_No_Arm/s2/s1.b3d"
 OUTPUT_ROOT = "output"
 
 # Sampling rate (Hz). The actual per-trial timestep is read from the file;
@@ -61,9 +61,10 @@ LPF_MARKERS_HZ    = 6.0   # cutoff frequency, Hz
 LPF_MARKERS_ORDER = 4     # Butterworth order (zero-phase doubles effective order)
 
 # Low-pass filter applied to IK positions from pass 1 (Stage 2).
-# Pass 1 is already filtered by AddBiomechanics at their stored cutoff.
-# Set LPF_IK_HZ to None to skip this second filter and use pass 1 as-is.
-LPF_IK_HZ    = None   # e.g. 6.0 to re-filter, or None to skip
+# Pass 1 is already filtered by AddBiomechanics at their stored cutoff,
+# so an additional filter here is typically redundant. Default None.
+# Set LPF_IK_HZ to a float (e.g. 6.0) only if you need extra smoothing.
+LPF_IK_HZ    = None
 LPF_IK_ORDER = 4
 
 # Frames to read per batch (reduce if RAM is tight).
@@ -79,7 +80,19 @@ def _append_beta_coords(ik_out: np.ndarray, dof_names: list) -> tuple[np.ndarray
     Append patellofemoral beta coordinates required by the LaiArnold model.
 
     The CoordinateCouplerConstraint uses a LinearFunction with coefficients
-    [1, 0], so beta equals the corresponding knee angle at every frame.
+    [1, 0], i.e. beta = 1 * knee_angle + 0, evaluated by OpenSim in RADIANS
+    (internal units). In the .mot, standard rotational coords like
+    'knee_angle_r' are auto-converted deg->rad on load (because inDegrees=yes
+    and they are typed as Rotational). The 'knee_angle_*_beta' coords in the
+    LaiArnold/Rajagopal model are NOT auto-converted by the .mot loader, so
+    they must be written in radians even when the rest of the file is degrees.
+    Writing beta in degrees produces a ~57x overshoot at the patella, pulling
+    vastus/rectus attachments off the femur (classic 'distended vasti' bug).
+
+    This function is called AFTER _rad_to_deg_ik, so ik_out already has the
+    knee_angle_* columns in degrees; we therefore convert them back to radians
+    when populating the beta columns.
+
     Returns the augmented array and the extended dof name list.
     """
     beta_cols = {
@@ -90,14 +103,15 @@ def _append_beta_coords(ik_out: np.ndarray, dof_names: list) -> tuple[np.ndarray
     for beta_name, source_name in beta_cols.items():
         if beta_name not in dof_names and source_name in dof_names:
             src_idx = dof_names.index(source_name)
-            beta_data[beta_name] = ik_out[:, src_idx].copy()
+            # ik_out[:, src_idx] is in degrees; beta must be written in radians
+            beta_data[beta_name] = np.radians(ik_out[:, src_idx])
 
     if not beta_data:
         return ik_out, dof_names
 
-    extra = np.column_stack([np.deg2rad(vals) for vals in beta_data.values()])
+    extra = np.column_stack(list(beta_data.values()))
     ik_out = np.hstack([ik_out, extra])
-    print(f"    Appended beta coords (radians): {list(beta_data.keys())}")
+    print(f"    Appended beta coords in radians: {list(beta_data.keys())}")
     return ik_out, dof_names + list(beta_data.keys())
 
 
@@ -208,9 +222,21 @@ def process_trial(
     timestep   = subject.getTrialTimestep(trial_idx)
     fs         = (1.0 / timestep) if timestep > 0 else float(SAMPLE_RATE_HZ)
 
+    # Fix #11: recover this trial's absolute start time if it's a split piece
+    # of a longer original recording. nimble exposes getTrialSplitIndex(),
+    # which is the 0-based ordinal of this piece within the original trial.
+    # Assuming pieces are contiguous and equal length, t0 = split * dt * n.
+    # (If the API isn't available in this build, fall back to t0 = 0.)
+    try:
+        split_idx = subject.getTrialSplitIndex(trial_idx)
+    except Exception:
+        split_idx = 0
+    t0 = float(split_idx) * n_frames * timestep if timestep > 0 else 0.0
+
     print(f"\n{'-'*50}")
     print(f"  Trial {trial_idx}: {trial_name}")
-    print(f"  Frames: {n_frames}  fs: {fs:.4f} Hz  ({n_frames / fs:.2f} s)")
+    print(f"  Frames: {n_frames}  fs: {fs:.4f} Hz  "
+          f"({n_frames / fs:.2f} s, t0={t0:.3f}s)")
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -223,21 +249,28 @@ def process_trial(
     moment_names = meta["moment_names"]
     marker_names = meta["marker_names"]
 
+    # Fix #3-adjacent: redesign the marker LPF at this trial's actual fs
+    # rather than reusing the subject-level filter built with SAMPLE_RATE_HZ.
+    sos_markers_trial = make_lpf(LPF_MARKERS_HZ, LPF_MARKERS_ORDER, fs)
+
     # Stage 1: markers
     print("  [Stage 1] Markers...")
     raw_markers      = extract_markers(frames, marker_names)
-    filtered_markers = apply_lpf(raw_markers, sos_markers)
-    write_trc(out_dir / "markers.trc", marker_names, filtered_markers, fs)
+    filtered_markers = apply_lpf(raw_markers, sos_markers_trial)
+    write_trc(out_dir / "markers.trc", marker_names, filtered_markers, fs,
+              t0=t0)
 
     # Stage 2: IK
-    print("  [Stage 2] IK (pass 1: LOW_PASS_FILTER)...")
+    print(f"  [Stage 2] IK (pass {IK_PASS_IDX}: "
+          f"{'LOW_PASS_FILTER' if IK_PASS_IDX == 1 else 'other'})...")
     ik_rad = extract_ik(frames, n_dofs, IK_PASS_IDX)
     if LPF_IK_HZ is not None:
         sos_ik = make_lpf(LPF_IK_HZ, LPF_IK_ORDER, fs)
         ik_rad = apply_lpf(ik_rad, sos_ik)
         print(f"    Additional LPF applied: {LPF_IK_HZ} Hz order {LPF_IK_ORDER}")
     else:
-        print("    No additional LPF (pass 1 used as-is).")
+        print("    No additional LPF (pass already filtered by "
+              "AddBiomechanics; used as-is).")
 
     ik_out                 = _rad_to_deg_ik(ik_rad, dof_names)
     ik_out, aug_dof_names  = _append_beta_coords(ik_out, dof_names)
@@ -246,6 +279,7 @@ def process_trial(
         out_dir / "ik.mot", aug_dof_names,
         ik_out, fs,
         header_name="Coordinates", in_degrees=True,
+        t0=t0,
     )
 
     # Stage 3a: ID moments
@@ -254,14 +288,16 @@ def process_trial(
     write_sto(
         out_dir / "id_moments.sto", moment_names, tau, fs,
         header_name="InverseDynamics",
+        t0=t0,
     )
 
     # Stage 3b: GRF
-    print("  [Stage 3b] GRF...")
-    grf = extract_grf(frames)
+    print("  [Stage 3b] GRF (from dynamics pass)...")
+    grf = extract_grf(frames, pass_idx=ID_PASS_IDX)
     write_mot(
         out_dir / "grf.mot", GRF_COLUMNS, grf, fs,
         header_name="GRF", in_degrees=False,
+        t0=t0,
     )
 
     # Stage 3c: body params
@@ -286,13 +322,12 @@ def process_subject(b3d_path: str, output_root: Path) -> None:
     osim_path.write_text(osim_text)
     print(f"  [osim] model -> {osim_path}")
 
-    # Design the marker filter once (fs fallback; per-trial fs used inside loop)
-    sos_markers = make_lpf(LPF_MARKERS_HZ, LPF_MARKERS_ORDER, SAMPLE_RATE_HZ)
-
+    # Marker LPF is designed per-trial inside process_trial() using each
+    # trial's actual fs (avoids wrong cutoff when fs != SAMPLE_RATE_HZ).
     for trial_idx in range(subject.getNumTrials()):
         trial_name = subject.getTrialName(trial_idx) or f"trial_{trial_idx:02d}"
         out_dir    = subject_out_dir / trial_name
-        process_trial(subject, trial_idx, out_dir, meta, sos_markers)
+        process_trial(subject, trial_idx, out_dir, meta, sos_markers=None)
 
     print(f"\n{'='*60}")
     print(f"Done. Outputs in: {output_root / meta['subject_name']}/")

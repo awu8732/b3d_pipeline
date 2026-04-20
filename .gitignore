@@ -6,4 +6,4 @@ output/
 *.sto
 *.trc
 *.json
-.env
+.

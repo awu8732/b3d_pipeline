@@ -15,8 +15,8 @@ from b3d_io      import read_mot_sto, write_sto
 from b3d_filters import apply_lpf_columns
 
 # ── CONFIG ───────────────────────────────────────────────────────────────────
-INPUT_FILE  = "/mnt/d/output/subject10/run200_segment_0/rra/results_rra_2/rra_run_2_Kinematics_q.sto"
-OUTPUT_FILE = "/mnt/d/output/subject10/run200_segment_0/rra/results_rra_2/rra_run_2_Kinematics_q_filtered.sto"
+INPUT_FILE  = "/mnt/d/output/P010_split0/walk_fast_1_segment_0/ik.mot"
+OUTPUT_FILE = "/mnt/d/output/P010_split0/walk_fast_1_segment_0/ik_filtered.mot"
 CUTOFF_HZ   = 15.0   # low-pass cutoff frequency in Hz
 # ─────────────────────────────────────────────────────────────────────────────
 

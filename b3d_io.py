@@ -21,7 +21,8 @@ import numpy as np
 
 # ── WRITERS ──────────────────────────────────────────────────────────────────
 
-def write_trc(path: Path, marker_names: list, data: np.ndarray, fs: float) -> None:
+def write_trc(path: Path, marker_names: list, data: np.ndarray, fs: float,
+              t0: float = 0.0) -> None:
     """
     Write an OpenSim .trc file.
 
@@ -31,13 +32,16 @@ def write_trc(path: Path, marker_names: list, data: np.ndarray, fs: float) -> No
     marker_names : list of marker label strings
     data         : (n_frames, n_markers * 3)  column order: X0 Y0 Z0 X1 Y1 Z1 ...
     fs           : sampling rate in Hz
+    t0           : time of frame 0 (seconds). Non-zero when the trial is a
+                   split piece of a larger original trial; preserves alignment
+                   with external EMG/video timestamps.
     """
     n_frames  = data.shape[0]
     n_markers = len(marker_names)
     assert data.shape[1] == n_markers * 3, (
         f"Expected {n_markers * 3} columns, got {data.shape[1]}"
     )
-    t = np.arange(n_frames) / fs
+    t = t0 + np.arange(n_frames) / fs
     with open(path, "w") as f:
         f.write(f"PathFileType\t4\t(X/Y/Z)\t{path.name}\n")
         f.write(
@@ -66,10 +70,14 @@ def write_mot(
     fs: float,
     header_name: str = "motion",
     in_degrees: bool = True,
+    t0: float = 0.0,
 ) -> None:
-    """Write an OpenSim .mot file (IK angles or GRF)."""
+    """Write an OpenSim .mot file (IK angles or GRF).
+
+    t0 is the time (s) of frame 0; non-zero for split trials.
+    """
     n_frames = data.shape[0]
-    t        = np.arange(n_frames) / fs
+    t        = t0 + np.arange(n_frames) / fs
     all_cols = ["time"] + col_names
     all_data = np.column_stack([t, data])
     with open(path, "w") as f:
@@ -91,10 +99,14 @@ def write_sto(
     data: np.ndarray,
     fs: float,
     header_name: str = "inverse_dynamics",
+    t0: float = 0.0,
 ) -> None:
-    """Write an OpenSim .sto file (ID moments)."""
+    """Write an OpenSim .sto file (ID moments).
+
+    t0 is the time (s) of frame 0; non-zero for split trials.
+    """
     n_frames = data.shape[0]
-    t        = np.arange(n_frames) / fs
+    t        = t0 + np.arange(n_frames) / fs
     all_cols = ["time"] + col_names
     all_data = np.column_stack([t, data])
     with open(path, "w") as f:
