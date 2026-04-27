@@ -176,7 +176,9 @@ def extract_id(frames: list, n_dofs: int, pass_idx: int) -> np.ndarray:
     return out
 
 
-def extract_grf(frames: list, pass_idx: int = 2) -> np.ndarray:
+def extract_grf(frames: list, pass_idx: int = 2,
+                hold_cop_through_swing: bool = True,
+                zero_force_threshold: float = 1e-6) -> np.ndarray:
     """
     Build a (n_frames, 18) bilateral GRF array from processing-pass data.
 
@@ -189,21 +191,46 @@ def extract_grf(frames: list, pass_idx: int = 2) -> np.ndarray:
       groundContactCenterOfPressure -> (6,)
       groundContactTorque           -> (6,)
 
-    Left/right mapping (empirically confirmed):
-      getGroundForceBodies() returns ['calcn_r', 'calcn_l'], suggesting
-      body 0 = calcn_r and body 1 = calcn_l. However, cross-referencing
-      single-support frames against IK joint angles reveals that when
-      contact=[0,1] (body 1 active), the stance leg is anatomically RIGHT
-      (hip extending, knee flexed on the right side). This means the
-      nimblephysics body labels are swapped relative to the OpenSim
-      skeleton's anatomical convention.
+    Left/right mapping:
+      getGroundForceBodies() returns ['calcn_r', 'calcn_l'], so:
+        6vec[0:3] = body 0 = calcn_r = anatomical RIGHT -> ground_force_*
+        6vec[3:6] = body 1 = calcn_l = anatomical LEFT  -> l_ground_force_*
 
-      Mapping confirmed by reserve actuator magnitudes: with the correct
-      mapping, pelvis_ty_reserve drops from ~826 N (107% BW) to near zero,
-      and ankle/hip reserves become physiologically plausible.
+      An earlier version of this file swapped these based on a
+      residual-actuator test that dropped pelvis_ty_reserve from ~826 N to
+      near zero. That test was confounded by the swing-frame CoP bug fixed
+      below: during swing, pass 2 reports CoP=(0,0,0) for the non-contact
+      foot, which produces artificial pelvis moments around heel-strike and
+      toe-off transitions that happen to partially cancel under the swapped
+      mapping. Re-running the residual test with hold_cop_through_swing=True
+      shows the anatomical mapping above is correct.
 
-      6vec[0:3] = body 0 = anatomical LEFT  -> OpenSim l_ground_force_*
-      6vec[3:6] = body 1 = anatomical RIGHT -> OpenSim ground_force_*
+      Cross-checks confirming this mapping:
+        1. CoP lateral position: slot0 stance z is more positive than
+           slot1 stance z, matching +z = subject's right in OpenSim's
+           default frame (with subject facing +x, pelvis_rotation ~ 0).
+        2. Hip flexion during single stance: when only slot1 has force,
+           hip_flexion_l is extended (leg trailing) and hip_flexion_r
+           is flexed (leg swinging) -> slot1 is anatomical left.
+        3. getGroundForceBodies() declaration agrees with both.
+
+    Swing-frame CoP handling:
+      Pass 2 reports CoP=(0,0,0) for a foot whenever its Fv=0 (swing phase
+      and trial-boundary frames). OpenSim's ID and SO ignore CoP when Fv=0,
+      so these zeros are dynamically harmless -- but visualizers draw the
+      GRF arrow from the world origin, producing the "floating arrow"
+      artifact between the feet. Some downstream tools also mis-handle the
+      CoP=(0,0,0) sentinel.
+
+      When hold_cop_through_swing=True (default), this function carries
+      each foot's CoP forward from its last active frame across subsequent
+      swing frames, and backward-fills any swing frames before that foot's
+      first activation. Forces and torques are NOT modified; only CoP
+      during Fv=0 frames. This is a pure visualization/downstream-tool fix
+      that does not alter ID/SO results.
+
+      Set hold_cop_through_swing=False to preserve the raw pass-2 behaviour
+      (zero CoP during swing).
 
     Column layout matches GRF_COLUMNS (18-column OpenSim bilateral format):
       cols  0-2:  right force   (vx vy vz)
@@ -215,15 +242,19 @@ def extract_grf(frames: list, pass_idx: int = 2) -> np.ndarray:
 
     Parameters
     ----------
-    frames   : list of Frame objects
-    pass_idx : processing pass to read from (default 2 = DYNAMICS)
+    frames                 : list of Frame objects
+    pass_idx               : processing pass to read from (default 2 = DYNAMICS)
+    hold_cop_through_swing : if True, forward/backward-fill CoP across
+                             Fv=0 frames (default True)
+    zero_force_threshold   : |F| below this is considered a zero-force frame
+                             for CoP-fill purposes (default 1e-6 N)
 
     Returns
     -------
     (n_frames, 18) float64 array
     """
-    _ANAT_LEFT  = slice(0, 3)   # 6vec[0:3] = anatomical left foot
-    _ANAT_RIGHT = slice(3, 6)   # 6vec[3:6] = anatomical right foot
+    _ANAT_RIGHT = slice(0, 3)   # 6vec[0:3] = calcn_r = anatomical right
+    _ANAT_LEFT  = slice(3, 6)   # 6vec[3:6] = calcn_l = anatomical left
 
     out = np.zeros((len(frames), 18))
     for fi, frame in enumerate(frames):
@@ -232,16 +263,53 @@ def extract_grf(frames: list, pass_idx: int = 2) -> np.ndarray:
         cop = np.array(pp.groundContactCenterOfPressure)
         trq = np.array(pp.groundContactTorque)
 
-        # Anatomical RIGHT -> OpenSim "ground_force_*" columns
+        # Anatomical RIGHT (calcn_r, 6vec[0:3]) -> OpenSim "ground_force_*"
         out[fi, 0:3]   = frc[_ANAT_RIGHT]
         out[fi, 3:6]   = cop[_ANAT_RIGHT]
-        # Anatomical LEFT  -> OpenSim "l_ground_force_*" columns
+        # Anatomical LEFT  (calcn_l, 6vec[3:6]) -> OpenSim "l_ground_force_*"
         out[fi, 6:9]   = frc[_ANAT_LEFT]
         out[fi, 9:12]  = cop[_ANAT_LEFT]
         # Torques
         out[fi, 12:15] = trq[_ANAT_RIGHT]
         out[fi, 15:18] = trq[_ANAT_LEFT]
+
+    if hold_cop_through_swing:
+        _fill_swing_cop(out, (slice(0, 3), slice(3, 6)),   # right: force, CoP
+                        zero_force_threshold)
+        _fill_swing_cop(out, (slice(6, 9), slice(9, 12)),  # left:  force, CoP
+                        zero_force_threshold)
+
     return out
+
+
+def _fill_swing_cop(out: np.ndarray, slices: tuple,
+                    threshold: float) -> None:
+    """
+    In-place: carry CoP forward through frames where the foot's force is
+    below `threshold`. Backward-fills any leading swing frames before the
+    first active frame. If the foot is never active in this trial, CoP is
+    left as zeros (there is no sensible value to fill with).
+
+    `slices` is (force_slice, cop_slice). Each slice is a 3-element slice
+    into the 18-column GRF array for one foot (force v and CoP p).
+    """
+    force_slice, cop_slice = slices
+    force_mag = np.linalg.norm(out[:, force_slice], axis=1)
+    active    = force_mag > threshold
+    if not active.any():
+        return  # foot never loaded in this trial -- leave zeros
+
+    first = int(np.argmax(active))
+    last_cop = out[first, cop_slice].copy()
+    for i in range(first, len(out)):
+        if active[i]:
+            last_cop = out[i, cop_slice].copy()
+        else:
+            out[i, cop_slice] = last_cop
+
+    # Backward-fill frames before first activation with the first active CoP.
+    if first > 0:
+        out[:first, cop_slice] = out[first, cop_slice]
 
 
 def extract_grf_raw(frames: list) -> np.ndarray:

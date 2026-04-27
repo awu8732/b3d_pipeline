@@ -9,7 +9,6 @@ Confirmed API against nimblephysics (Hammer2013 dataset, 3-pass B3D):
   Pass 2: DYNAMICS         -- joint moments (tau), used for ID output
 
 Outputs per trial (OUTPUT_ROOT / <subject_tag> / <trial_name> /):
-  markers.trc      -- low-pass filtered 3D marker trajectories
   ik.mot           -- IK joint angles (pass 1 pos + optional extra LPF), degrees
   id_moments.sto   -- ID joint moments from pass 2 tau, N·m
   grf.mot          -- bilateral GRF + CoP, single OpenSim 18-col layout
@@ -22,6 +21,13 @@ Internal modules (same directory):
   b3d_io.py       -- file writers/readers
   b3d_filters.py  -- Butterworth LPF helpers
   b3d_extract.py  -- frame-level data extraction
+
+CLI:
+  python process_b3d.py                         # process all trials
+  python process_b3d.py --list                  # list trials and exit
+  python process_b3d.py -t walk_fast_1_segment_1
+  python process_b3d.py -t 5 -t 7               # indices
+  python process_b3d.py --b3d other.b3d --out out2 -t 0
 """
 
 import os
@@ -31,10 +37,10 @@ from pathlib import Path
 import nimblephysics as nimble
 import numpy as np
 
-from b3d_io      import write_trc, write_mot, write_sto, write_body_json
+from b3d_io      import write_mot, write_sto, write_body_json
 from b3d_filters import make_lpf, apply_lpf
 from b3d_extract import (
-    read_all_frames, extract_markers, extract_ik, extract_id, extract_grf,
+    read_all_frames, extract_ik, extract_id, extract_grf,
     GRF_COLUMNS,
 )
 
@@ -43,8 +49,8 @@ from b3d_extract import (
 # CONFIG: edit this block; leave everything else alone
 # ════════════════════════════════════════════════════════════════════════════
 
-B3D_PATH    = "AddBiomechanicsDataset/train/No_Arm/Tan2021_Formatted_No_Arm/s2/s1.b3d"
-OUTPUT_ROOT = "output"
+B3D_PATH    = "AddBiomechanicsDataset/test/With_Arm/Carter2023_Formatted_With_Arm/P010_split0/P010_split0.b3d"
+OUTPUT_ROOT = "output1"
 
 # Sampling rate (Hz). The actual per-trial timestep is read from the file;
 # SAMPLE_RATE_HZ is used only for filter design and as a fallback if
@@ -55,10 +61,6 @@ SAMPLE_RATE_HZ = 100
 # Confirmed order for AddBiomechanics 3-pass B3D: 0=KIN, 1=LPF, 2=DYN.
 IK_PASS_IDX = 1   # LOW_PASS_FILTER pass: source for joint positions
 ID_PASS_IDX = 2   # DYNAMICS pass: source for joint moments (tau)
-
-# Low-pass filter applied to markers after extraction (Stage 1).
-LPF_MARKERS_HZ    = 6.0   # cutoff frequency, Hz
-LPF_MARKERS_ORDER = 4     # Butterworth order (zero-phase doubles effective order)
 
 # Low-pass filter applied to IK positions from pass 1 (Stage 2).
 # Pass 1 is already filtered by AddBiomechanics at their stored cutoff,
@@ -205,17 +207,15 @@ def process_trial(
     trial_idx: int,
     out_dir: Path,
     meta: dict,
-    sos_markers,
 ) -> None:
     """
     Run the full extraction + write pipeline for a single trial.
 
     Stages:
-      1. Markers   -> markers.trc
-      2. IK        -> ik.mot
-      3a. ID       -> id_moments.sto
-      3b. GRF      -> grf.mot
-      3c. Body     -> body.json
+      1. IK         -> ik.mot
+      2a. ID        -> id_moments.sto
+      2b. GRF       -> grf.mot
+      2c. Body      -> body.json
     """
     trial_name = subject.getTrialName(trial_idx) or f"trial_{trial_idx:02d}"
     n_frames   = subject.getTrialLength(trial_idx)
@@ -247,21 +247,13 @@ def process_trial(
     n_dofs       = meta["n_dofs"]
     dof_names    = meta["dof_names"]
     moment_names = meta["moment_names"]
-    marker_names = meta["marker_names"]
 
-    # Fix #3-adjacent: redesign the marker LPF at this trial's actual fs
-    # rather than reusing the subject-level filter built with SAMPLE_RATE_HZ.
-    sos_markers_trial = make_lpf(LPF_MARKERS_HZ, LPF_MARKERS_ORDER, fs)
+    # Stage 1 (markers -> .trc) intentionally skipped: downstream consumers
+    # (IK is already solved by AddBiomechanics, so ik.mot is the source of
+    # truth; markers are not re-used).
 
-    # Stage 1: markers
-    print("  [Stage 1] Markers...")
-    raw_markers      = extract_markers(frames, marker_names)
-    filtered_markers = apply_lpf(raw_markers, sos_markers_trial)
-    write_trc(out_dir / "markers.trc", marker_names, filtered_markers, fs,
-              t0=t0)
-
-    # Stage 2: IK
-    print(f"  [Stage 2] IK (pass {IK_PASS_IDX}: "
+    # Stage 1: IK
+    print(f"  [Stage 1] IK (pass {IK_PASS_IDX}: "
           f"{'LOW_PASS_FILTER' if IK_PASS_IDX == 1 else 'other'})...")
     ik_rad = extract_ik(frames, n_dofs, IK_PASS_IDX)
     if LPF_IK_HZ is not None:
@@ -282,8 +274,8 @@ def process_trial(
         t0=t0,
     )
 
-    # Stage 3a: ID moments
-    print("  [Stage 3a] ID moments (pass 2: DYNAMICS)...")
+    # Stage 2a: ID moments
+    print("  [Stage 2a] ID moments (pass 2: DYNAMICS)...")
     tau = extract_id(frames, n_dofs, ID_PASS_IDX)
     write_sto(
         out_dir / "id_moments.sto", moment_names, tau, fs,
@@ -291,8 +283,8 @@ def process_trial(
         t0=t0,
     )
 
-    # Stage 3b: GRF
-    print("  [Stage 3b] GRF (from dynamics pass)...")
+    # Stage 2b: GRF
+    print("  [Stage 2b] GRF (from dynamics pass)...")
     grf = extract_grf(frames, pass_idx=ID_PASS_IDX)
     write_mot(
         out_dir / "grf.mot", GRF_COLUMNS, grf, fs,
@@ -300,16 +292,80 @@ def process_trial(
         t0=t0,
     )
 
-    # Stage 3c: body params
+    # Stage 2c: body params
     write_body_json(out_dir / "body.json", meta["body_params"])
 
 
 # ── Top-level entry point ─────────────────────────────────────────────────────
 
-def process_subject(b3d_path: str, output_root: Path) -> None:
+def _resolve_trial_selection(subject, trials: list | None) -> list[int]:
+    """
+    Resolve a list of trial selectors (names, indices, or None=all) into a
+    de-duplicated, sorted list of valid trial indices. Raises on unknown names
+    or out-of-range indices.
+    """
+    n = subject.getNumTrials()
+    all_names = [subject.getTrialName(i) or f"trial_{i:02d}" for i in range(n)]
+
+    if not trials:
+        return list(range(n))
+
+    resolved: list[int] = []
+    for sel in trials:
+        # Try integer index first
+        try:
+            idx = int(sel)
+        except (TypeError, ValueError):
+            idx = None
+
+        if idx is not None:
+            if not (0 <= idx < n):
+                raise ValueError(
+                    f"Trial index {idx} out of range (0..{n - 1})."
+                )
+            resolved.append(idx)
+        else:
+            if sel not in all_names:
+                raise ValueError(
+                    f"Trial name '{sel}' not found. Use --list to see "
+                    f"available trials."
+                )
+            resolved.append(all_names.index(sel))
+
+    return sorted(set(resolved))
+
+
+def _list_trials(subject) -> None:
+    """Print one line per trial: index, name, frames, dt, duration."""
+    n = subject.getNumTrials()
+    print(f"  {n} trials in {Path.cwd()}:")
+    for i in range(n):
+        name = subject.getTrialName(i) or f"trial_{i:02d}"
+        nf   = subject.getTrialLength(i)
+        dt   = subject.getTrialTimestep(i)
+        dur  = nf * dt if dt > 0 else 0.0
+        print(f"    [{i:3d}] {name:<40s}  n={nf:5d}  dt={dt:.4f}  dur={dur:.2f}s")
+
+
+def process_subject(b3d_path: str, output_root: Path,
+                    trials: list | None = None,
+                    list_only: bool = False) -> None:
+    """
+    Parameters
+    ----------
+    b3d_path    : path to .b3d file
+    output_root : root output directory
+    trials      : None = process all. Otherwise a list of trial names or
+                  integer indices (mixed OK). Unknown entries raise.
+    list_only   : if True, print trial list and return without processing.
+    """
     print(f"\n{'='*60}")
     print(f"Loading : {b3d_path}")
     subject = nimble.biomechanics.SubjectOnDisk(b3d_path)
+
+    if list_only:
+        _list_trials(subject)
+        return
 
     meta = _load_subject_metadata(subject, b3d_path)
 
@@ -322,16 +378,61 @@ def process_subject(b3d_path: str, output_root: Path) -> None:
     osim_path.write_text(osim_text)
     print(f"  [osim] model -> {osim_path}")
 
-    # Marker LPF is designed per-trial inside process_trial() using each
-    # trial's actual fs (avoids wrong cutoff when fs != SAMPLE_RATE_HZ).
-    for trial_idx in range(subject.getNumTrials()):
+    trial_indices = _resolve_trial_selection(subject, trials)
+    print(f"  Processing {len(trial_indices)} of "
+          f"{subject.getNumTrials()} trials: {trial_indices}")
+
+    # .trc output removed: AddBiomechanics-solved IK is the source of truth.
+    for trial_idx in trial_indices:
         trial_name = subject.getTrialName(trial_idx) or f"trial_{trial_idx:02d}"
         out_dir    = subject_out_dir / trial_name
-        process_trial(subject, trial_idx, out_dir, meta, sos_markers=None)
+        process_trial(subject, trial_idx, out_dir, meta)
 
     print(f"\n{'='*60}")
     print(f"Done. Outputs in: {output_root / meta['subject_name']}/")
 
 
+def _parse_args(argv: list[str] | None = None):
+    import argparse
+    p = argparse.ArgumentParser(
+        description="Process a B3D file into OpenSim-compatible outputs.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Process all trials (default paths from CONFIG block):
+  python process_b3d.py
+
+  # List trials without processing:
+  python process_b3d.py --list
+
+  # Process one trial by name:
+  python process_b3d.py --trial walk_fast_1_segment_1
+
+  # Process multiple trials (names or indices, mixed):
+  python process_b3d.py --trial walk_fast_1_segment_1 --trial 5 --trial Static_1_segment_0
+
+  # Override B3D and output paths:
+  python process_b3d.py --b3d path/to/other.b3d --out my_output --trial 5
+""",
+    )
+    p.add_argument("--b3d", default=B3D_PATH,
+                   help=f"Path to .b3d file (default from CONFIG: {B3D_PATH})")
+    p.add_argument("--out", default=OUTPUT_ROOT,
+                   help=f"Output root directory (default: {OUTPUT_ROOT})")
+    p.add_argument("--trial", "-t", action="append", default=None,
+                   metavar="NAME_OR_INDEX",
+                   help="Trial to process (name or 0-based index). Repeat "
+                        "to process multiple. Omit to process all.")
+    p.add_argument("--list", "-l", action="store_true", dest="list_only",
+                   help="List trials in the B3D and exit without processing.")
+    return p.parse_args(argv)
+
+
 if __name__ == "__main__":
-    process_subject(B3D_PATH, Path(OUTPUT_ROOT))
+    args = _parse_args()
+    process_subject(
+        b3d_path    = args.b3d,
+        output_root = Path(args.out),
+        trials      = args.trial,
+        list_only   = args.list_only,
+    )
