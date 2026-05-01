@@ -12,6 +12,7 @@ Outputs per trial (OUTPUT_ROOT / <subject_tag> / <trial_name> /):
   ik.mot           -- IK joint angles (pass 1 pos + optional extra LPF), degrees
   id_moments.sto   -- ID joint moments from pass 2 tau, N·m
   grf.mot          -- bilateral GRF + CoP, single OpenSim 18-col layout
+  grf_qc.json      -- per-trial CoP-foot alignment QC (always written)
   body.json        -- subject-level body parameters
 
 Dependencies:
@@ -21,13 +22,14 @@ Internal modules (same directory):
   b3d_io.py       -- file writers/readers
   b3d_filters.py  -- Butterworth LPF helpers
   b3d_extract.py  -- frame-level data extraction
+  b3d_grf_qc.py   -- CoP-foot alignment flagging + optional projection
 
 CLI:
-  python process_b3d.py                         # process all trials
-  python process_b3d.py --list                  # list trials and exit
+  python process_b3d.py                       # all trials
+  python process_b3d.py --list                # list and exit
   python process_b3d.py -t walk_fast_1_segment_1
-  python process_b3d.py -t 5 -t 7               # indices
-  python process_b3d.py --b3d other.b3d --out out2 -t 0
+  python process_b3d.py -t 5 --qc-correct     # project flagged CoPs
+  python process_b3d.py -t 5 --qc-threshold 0.05
 """
 
 import os
@@ -43,6 +45,9 @@ from b3d_extract import (
     read_all_frames, extract_ik, extract_id, extract_grf,
     GRF_COLUMNS,
 )
+from b3d_grf_qc  import (
+    flag_cop_outliers, correct_cop_outliers, write_qc_sidecar,
+)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -50,7 +55,7 @@ from b3d_extract import (
 # ════════════════════════════════════════════════════════════════════════════
 
 B3D_PATH    = "AddBiomechanicsDataset/test/With_Arm/Carter2023_Formatted_With_Arm/P010_split0/P010_split0.b3d"
-OUTPUT_ROOT = "output1"
+OUTPUT_ROOT = "output/grf_qc"
 
 # Sampling rate (Hz). The actual per-trial timestep is read from the file;
 # SAMPLE_RATE_HZ is used only for filter design and as a fallback if
@@ -189,14 +194,27 @@ def _load_subject_metadata(subject, b3d_path: str) -> dict:
     except Exception:
         body_params["body_scales"] = {}
 
+    # Per-body 3-vector scales for the QC module. nimble's getBodyScales()
+    # returns a flat array in body-index order; we map by body name.
+    body_scales_dict: dict[str, list[float]] = {}
+    try:
+        scales_flat = np.asarray(skel.getBodyScales()).reshape(-1, 3)
+        for bi in range(skel.getNumBodyNodes()):
+            name = skel.getBodyNode(bi).getName()
+            if bi < len(scales_flat):
+                body_scales_dict[name] = scales_flat[bi].tolist()
+    except Exception:
+        body_scales_dict = {}
+
     return dict(
-        subject_name = subject_name,
-        n_dofs       = n_dofs,
-        dof_names    = dof_names,
-        moment_names = moment_names,
-        marker_names = marker_names,
-        body_params  = body_params,
-        skel         = skel,
+        subject_name     = subject_name,
+        n_dofs           = n_dofs,
+        dof_names        = dof_names,
+        moment_names     = moment_names,
+        marker_names     = marker_names,
+        body_params      = body_params,
+        body_scales_dict = body_scales_dict,
+        skel             = skel,
     )
 
 
@@ -286,11 +304,39 @@ def process_trial(
     # Stage 2b: GRF
     print("  [Stage 2b] GRF (from dynamics pass)...")
     grf = extract_grf(frames, pass_idx=ID_PASS_IDX)
+
+    # Stage 2b.1: GRF QC -- always-on flagging, optional correction.
+    qc_threshold_m = meta.get("qc_threshold_m", 0.03)
+    qc_correct     = meta.get("qc_correct", False)
+
+    print(f"  [Stage 2b.1] GRF QC (threshold={qc_threshold_m*100:.1f} cm, "
+          f"correct={qc_correct})...")
+    qc = flag_cop_outliers(
+        grf            = grf,
+        skel           = meta["skel"],
+        ik_rad         = ik_rad,
+        body_scales    = meta.get("body_scales_dict"),
+        threshold_m    = qc_threshold_m,
+    )
+    print(f"    flagged R: {qc['flagged_frame_count_r']:5d} / "
+          f"{qc['total_stance_frames_r']:5d} stance frames "
+          f"(max dist {qc['trial_max_distance_r']*100:.1f} cm)")
+    print(f"    flagged L: {qc['flagged_frame_count_l']:5d} / "
+          f"{qc['total_stance_frames_l']:5d} stance frames "
+          f"(max dist {qc['trial_max_distance_l']*100:.1f} cm)")
+
+    if qc_correct:
+        grf, n_fixed = correct_cop_outliers(grf, qc, threshold_m=qc_threshold_m)
+        qc["correction_applied"]    = True
+        qc["n_corrected_total"]     = n_fixed
+        print(f"    corrected {n_fixed} frame-side CoPs")
+
     write_mot(
         out_dir / "grf.mot", GRF_COLUMNS, grf, fs,
         header_name="GRF", in_degrees=False,
         t0=t0,
     )
+    write_qc_sidecar(out_dir / "grf_qc.json", qc)
 
     # Stage 2c: body params
     write_body_json(out_dir / "body.json", meta["body_params"])
@@ -312,7 +358,6 @@ def _resolve_trial_selection(subject, trials: list | None) -> list[int]:
 
     resolved: list[int] = []
     for sel in trials:
-        # Try integer index first
         try:
             idx = int(sel)
         except (TypeError, ValueError):
@@ -338,7 +383,7 @@ def _resolve_trial_selection(subject, trials: list | None) -> list[int]:
 def _list_trials(subject) -> None:
     """Print one line per trial: index, name, frames, dt, duration."""
     n = subject.getNumTrials()
-    print(f"  {n} trials in {Path.cwd()}:")
+    print(f"  {n} trials:")
     for i in range(n):
         name = subject.getTrialName(i) or f"trial_{i:02d}"
         nf   = subject.getTrialLength(i)
@@ -349,15 +394,24 @@ def _list_trials(subject) -> None:
 
 def process_subject(b3d_path: str, output_root: Path,
                     trials: list | None = None,
-                    list_only: bool = False) -> None:
+                    list_only: bool = False,
+                    qc_threshold_m: float = 0.03,
+                    qc_correct: bool = False) -> None:
     """
     Parameters
     ----------
-    b3d_path    : path to .b3d file
-    output_root : root output directory
-    trials      : None = process all. Otherwise a list of trial names or
-                  integer indices (mixed OK). Unknown entries raise.
-    list_only   : if True, print trial list and return without processing.
+    b3d_path       : path to .b3d file
+    output_root    : root output directory
+    trials         : None = process all. Otherwise a list of trial names or
+                     integer indices (mixed OK). Unknown entries raise.
+    list_only      : if True, print trial list and return without processing.
+    qc_threshold_m : CoP-foot distance threshold for the GRF QC step (m).
+                     Frames with distance > threshold are flagged in
+                     grf_qc.json, and (if qc_correct=True) projected onto
+                     the foot polygon.
+    qc_correct     : if True, project flagged CoPs onto the foot polygon
+                     before writing grf.mot. Force vector and free torque
+                     are not modified.
     """
     print(f"\n{'='*60}")
     print(f"Loading : {b3d_path}")
@@ -368,6 +422,8 @@ def process_subject(b3d_path: str, output_root: Path,
         return
 
     meta = _load_subject_metadata(subject, b3d_path)
+    meta["qc_threshold_m"] = qc_threshold_m
+    meta["qc_correct"]     = qc_correct
 
     subject_out_dir = output_root / meta["subject_name"]
     subject_out_dir.mkdir(parents=True, exist_ok=True)
@@ -381,6 +437,8 @@ def process_subject(b3d_path: str, output_root: Path,
     trial_indices = _resolve_trial_selection(subject, trials)
     print(f"  Processing {len(trial_indices)} of "
           f"{subject.getNumTrials()} trials: {trial_indices}")
+    print(f"  GRF QC: threshold={qc_threshold_m*100:.1f} cm, "
+          f"correction={'ON' if qc_correct else 'OFF'}")
 
     # .trc output removed: AddBiomechanics-solved IK is the source of truth.
     for trial_idx in trial_indices:
@@ -399,24 +457,17 @@ def _parse_args(argv: list[str] | None = None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Process all trials (default paths from CONFIG block):
   python process_b3d.py
-
-  # List trials without processing:
   python process_b3d.py --list
-
-  # Process one trial by name:
   python process_b3d.py --trial walk_fast_1_segment_1
-
-  # Process multiple trials (names or indices, mixed):
-  python process_b3d.py --trial walk_fast_1_segment_1 --trial 5 --trial Static_1_segment_0
-
-  # Override B3D and output paths:
-  python process_b3d.py --b3d path/to/other.b3d --out my_output --trial 5
+  python process_b3d.py -t 5 -t 7
+  python process_b3d.py --b3d other.b3d --out my_output -t 0
+  python process_b3d.py -t 5 --qc-correct           # project flagged CoPs
+  python process_b3d.py -t 5 --qc-threshold 0.05    # 5 cm tolerance
 """,
     )
     p.add_argument("--b3d", default=B3D_PATH,
-                   help=f"Path to .b3d file (default from CONFIG: {B3D_PATH})")
+                   help=f"Path to .b3d file (default: {B3D_PATH})")
     p.add_argument("--out", default=OUTPUT_ROOT,
                    help=f"Output root directory (default: {OUTPUT_ROOT})")
     p.add_argument("--trial", "-t", action="append", default=None,
@@ -424,15 +475,26 @@ Examples:
                    help="Trial to process (name or 0-based index). Repeat "
                         "to process multiple. Omit to process all.")
     p.add_argument("--list", "-l", action="store_true", dest="list_only",
-                   help="List trials in the B3D and exit without processing.")
+                   help="List trials in the B3D and exit.")
+    p.add_argument("--qc-threshold", type=float, default=0.03,
+                   metavar="METRES",
+                   help="CoP-to-foot distance threshold (m). Frames with "
+                        "distance above this are flagged in grf_qc.json "
+                        "(default: 0.03 = 3 cm).")
+    p.add_argument("--qc-correct", action="store_true",
+                   help="If set, project flagged CoPs onto the foot polygon "
+                        "before writing grf.mot. Force vector and free "
+                        "torque are not modified.")
     return p.parse_args(argv)
 
 
 if __name__ == "__main__":
     args = _parse_args()
     process_subject(
-        b3d_path    = args.b3d,
-        output_root = Path(args.out),
-        trials      = args.trial,
-        list_only   = args.list_only,
+        b3d_path       = args.b3d,
+        output_root    = Path(args.out),
+        trials         = args.trial,
+        list_only      = args.list_only,
+        qc_threshold_m = args.qc_threshold,
+        qc_correct     = args.qc_correct,
     )
