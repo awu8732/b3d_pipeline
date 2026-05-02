@@ -244,6 +244,9 @@ def flag_cop_outliers(
     def _safe_mean(a):
         a = a[~np.isnan(a)]
         return float(a.mean()) if a.size else 0.0
+    def _safe_median(a):
+        a = a[~np.isnan(a)]
+        return float(np.median(a)) if a.size else 0.0
 
     return {
         "threshold_m":               threshold_m,
@@ -263,6 +266,8 @@ def flag_cop_outliers(
         "trial_max_distance_l":      _safe_max(dist_l),
         "trial_mean_distance_r":     _safe_mean(dist_r),
         "trial_mean_distance_l":     _safe_mean(dist_l),
+        "trial_median_distance_r":   _safe_median(dist_r),
+        "trial_median_distance_l":   _safe_median(dist_l),
         # Cached internals used by correct_cop_outliers (not serialized).
         "_internals": {
             "cop_r_f":    cop_r_f,

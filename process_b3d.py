@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import os
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 import nimblephysics as nimble
@@ -54,12 +55,44 @@ from b3d_grf_qc  import (
     flag_cop_outliers, correct_cop_outliers, write_qc_sidecar,
 )
 
+# ── stderr suppression for nimble's C++ warnings ─────────────────────────────
+# nimble's geometry loader warnings come from C++ writing directly to fd 2,
+# which bypasses sys.stderr reassignment. We have to redirect at the OS
+# file-descriptor level by dup-ing fd 2 to /dev/null. This is module-global
+# (set once from CLI) and toggled by suppress_native_stderr().
+
+SUPPRESS_NATIVE_WARNINGS = True
+
+@contextmanager
+def suppress_native_stderr():
+    """
+    Redirect OS-level stderr (fd 2) to /dev/null for the duration of the
+    context. Captures warnings emitted by C/C++ extensions (such as nimble's
+    geometry loader) that bypass Python's sys.stderr.
+
+    No-op when SUPPRESS_NATIVE_WARNINGS is False.
+    """
+    if not SUPPRESS_NATIVE_WARNINGS:
+        yield
+        return
+    sys.stderr.flush()
+    saved_fd = os.dup(2)
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull_fd, 2)
+        os.close(devnull_fd)
+        yield
+    finally:
+        os.dup2(saved_fd, 2)
+        os.close(saved_fd)
+
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # CONFIG: edit this block; leave everything else alone
 # ════════════════════════════════════════════════════════════════════════════
 
-B3D_PATH    = "AddBiomechanicsDataset/train/No_Arm/Tan2021_Formatted_No_Arm/s1/s1.b3d"
+B3D_PATH    = "AddBiomechanicsDataset/test/With_Arm/Carter2023_Formatted_With_Arm/P010_split0/P010_split0.b3d"
 OUTPUT_ROOT = "output_exp"
 
 # Sampling rate (Hz). The actual per-trial timestep is read from the file;
@@ -165,13 +198,11 @@ def _load_subject_metadata(subject, b3d_path: str) -> dict:
     print(f"Trials  : {subject.getNumTrials()}    DOFs: {n_dofs}")
     print(f"Body    : {mass_kg:.1f} kg, {height_m:.3f} m")
 
-    # readSkel() emits C++ geometry-loading warnings to stderr; suppress them.
-    with open(os.devnull, "w") as _devnull:
-        _old, sys.stderr = sys.stderr, _devnull
-        try:
-            skel = subject.readSkel(0)
-        finally:
-            sys.stderr = _old
+    # readSkel() emits C++ geometry-loading warnings to stderr; suppress them
+    # via OS-level fd redirection (Python sys.stderr reassignment doesn't
+    # catch C++ warnings).
+    with suppress_native_stderr():
+        skel = subject.readSkel(0)
 
     dof_names    = [dof.getName() for dof in skel.getDofs()]
     moment_names = [f"{d}_moment" for d in dof_names]
@@ -325,10 +356,14 @@ def process_trial(
     )
     print(f"    flagged R: {qc['flagged_frame_count_r']:5d} / "
           f"{qc['total_stance_frames_r']:5d} stance frames "
-          f"(max dist {qc['trial_max_distance_r']*100:.1f} cm)")
+          f"(max {qc['trial_max_distance_r']*100:.1f} cm, "
+          f"mean {qc['trial_mean_distance_r']*100:.1f} cm, "
+          f"median {qc['trial_median_distance_r']*100:.1f} cm)")
     print(f"    flagged L: {qc['flagged_frame_count_l']:5d} / "
           f"{qc['total_stance_frames_l']:5d} stance frames "
-          f"(max dist {qc['trial_max_distance_l']*100:.1f} cm)")
+          f"(max {qc['trial_max_distance_l']*100:.1f} cm, "
+          f"mean {qc['trial_mean_distance_l']*100:.1f} cm, "
+          f"median {qc['trial_median_distance_l']*100:.1f} cm)")
 
     if qc_correct:
         grf, n_fixed = correct_cop_outliers(grf, qc, threshold_m=qc_threshold_m)
@@ -491,7 +526,8 @@ def process_subject(b3d_path: str, output_root: Path,
     """
     print(f"\n{'='*60}")
     print(f"Loading : {b3d_path}")
-    subject = nimble.biomechanics.SubjectOnDisk(b3d_path)
+    with suppress_native_stderr():
+        subject = nimble.biomechanics.SubjectOnDisk(b3d_path)
 
     if list_only:
         _list_trials(subject)
@@ -509,7 +545,8 @@ def process_subject(b3d_path: str, output_root: Path,
     subject_out_dir.mkdir(parents=True, exist_ok=True)
 
     # Write shared .osim model once at the subject level
-    osim_text = subject.getOpensimFileText(0)
+    with suppress_native_stderr():
+        osim_text = subject.getOpensimFileText(0)
     osim_path = subject_out_dir / f"{meta['subject_name']}.osim"
     osim_path.write_text(osim_text)
     print(f"  [osim] model -> {osim_path}")
@@ -524,7 +561,8 @@ def process_subject(b3d_path: str, output_root: Path,
     for trial_idx in trial_indices:
         trial_name = subject.getTrialName(trial_idx) or f"trial_{trial_idx:02d}"
         out_dir    = subject_out_dir / trial_name
-        process_trial(subject, trial_idx, out_dir, meta)
+        with suppress_native_stderr():
+            process_trial(subject, trial_idx, out_dir, meta)
 
     print(f"\n{'='*60}")
     print(f"Done. Outputs in: {subject_out_dir}/")
@@ -571,11 +609,17 @@ Examples:
                         "(e.g. '.../test/With_Arm/Carter2023_Formatted_With_Arm/...' "
                         "-> 'Carter2023_test_arm'). Falls back to 'Other' "
                         "on unrecognised paths.")
+    p.add_argument("--verbose-warnings", action="store_true",
+                   help="Show nimble's C++ geometry-loading warnings "
+                        "(missing .vtp.ply meshes, etc.). Off by default; "
+                        "these warnings are cosmetic and don't affect "
+                        "extraction outputs.")
     return p.parse_args(argv)
 
 
 if __name__ == "__main__":
     args = _parse_args()
+    SUPPRESS_NATIVE_WARNINGS = not args.verbose_warnings
     process_subject(
         b3d_path       = args.b3d,
         output_root    = Path(args.out),
