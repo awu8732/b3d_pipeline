@@ -51,6 +51,40 @@ from b3d_extract import (
     read_all_frames, extract_ik, extract_id, extract_grf,
     GRF_COLUMNS,
 )
+
+# ── Extraction log ────────────────────────────────────────────────────────────
+# All terminal output (stdout + stderr) is mirrored to a timestamped log file
+# written to OUTPUT_ROOT/extraction_<timestamp>.log. The Tee class writes each
+# line to both the original stream and the log file simultaneously.
+
+import datetime as _dt
+
+class _Tee:
+    """Mirror writes to two streams simultaneously."""
+    def __init__(self, primary, secondary):
+        self._p = primary
+        self._s = secondary
+    def write(self, data):
+        self._p.write(data)
+        self._s.write(data)
+        self._s.flush()
+    def flush(self):
+        self._p.flush()
+        self._s.flush()
+    def fileno(self):            # needed by os.dup2 / suppress_native_stderr
+        return self._p.fileno()
+
+def _start_extraction_log(output_root: Path, tag: str = "extraction") -> "IO[str]":
+    """Open a timestamped log file and tee stdout/stderr to it."""
+    output_root.mkdir(parents=True, exist_ok=True)
+    ts       = _dt.datetime.now().strftime("%Y%m%d")
+    log_path = output_root / f"extraction_{ts}_{tag}.log"
+    log_fh   = open(log_path, "w", buffering=1)   # line-buffered
+    sys.stdout = _Tee(sys.__stdout__, log_fh)
+    sys.stderr = _Tee(sys.__stderr__, log_fh)
+    print(f"[Log] Writing extraction log to: {log_path}")
+    return log_fh
+
 from b3d_grf_qc  import (
     flag_cop_outliers, correct_cop_outliers, write_qc_sidecar,
 )
@@ -216,31 +250,70 @@ def _load_subject_metadata(subject, b3d_path: str) -> dict:
     print(f"Markers : {len(marker_names)}")
     print(f"DOFs    : {dof_names}")
 
-    body_params = {
-        "subject_name": subject_name,
-        "href":         href,
-        "mass_kg":      mass_kg,
-        "height_m":     height_m,
-        "dof_names":    dof_names,
-        "marker_names": marker_names,
-        "grf_bodies":   list(subject.getGroundForceBodies()),
-    }
-    try:
-        body_params["body_scales"] = skel.getBodyScales().tolist()
-    except Exception:
-        body_params["body_scales"] = {}
-
-    # Per-body 3-vector scales for the QC module. nimble's getBodyScales()
-    # returns a flat array in body-index order; we map by body name.
+    # Fix 1 + 4: getBodyScales() returns all 1.0 when nimble bakes scaling into
+    # the geometry before saving (which AddBiomechanics always does). Use
+    # getBodyNode(bi).getScale() instead, which reads the live per-body 3-vector
+    # scale from the loaded skeleton geometry. Store as a named dict so
+    # downstream consumers (b3d_grf_qc, SO pipeline) can look up by body name
+    # without needing to know the skeleton body order.
     body_scales_dict: dict[str, list[float]] = {}
     try:
-        scales_flat = np.asarray(skel.getBodyScales()).reshape(-1, 3)
         for bi in range(skel.getNumBodyNodes()):
-            name = skel.getBodyNode(bi).getName()
-            if bi < len(scales_flat):
-                body_scales_dict[name] = scales_flat[bi].tolist()
+            node = skel.getBodyNode(bi)
+            body_scales_dict[node.getName()] = [float(v) for v in node.getScale()]
     except Exception:
         body_scales_dict = {}
+
+    if body_scales_dict:
+        all_one = all(
+            abs(v - 1.0) < 1e-6
+            for scales in body_scales_dict.values()
+            for v in scales
+        )
+        if all_one:
+            print(
+                "  [WARN] All body scales are 1.0. nimble may have baked "
+                "scaling into geometry; per-body scale dict may be unreliable."
+            )
+
+    # Fix 2: cross-check getMassKg() against the sum of body masses in the
+    # loaded skeleton. These should agree to <1%; a larger gap means the b3d
+    # mass metadata and the model geometry are inconsistent.
+    osim_mass_kg: float | None = None
+    try:
+        osim_mass_kg = sum(
+            skel.getBodyNode(bi).getMass()
+            for bi in range(skel.getNumBodyNodes())
+        )
+        mass_diff_pct = abs(osim_mass_kg - mass_kg) / max(mass_kg, 1e-6) * 100
+        if mass_diff_pct > 1.0:
+            print(
+                f"  [WARN] Mass mismatch: getMassKg()={mass_kg:.3f} kg vs "
+                f"sum of body masses={osim_mass_kg:.3f} kg "
+                f"({mass_diff_pct:.1f}% difference). "
+                "The written .osim may not match the declared subject mass."
+            )
+        else:
+            print(
+                f"  [OK]   Mass consistent: getMassKg()={mass_kg:.3f} kg, "
+                f"model sum={osim_mass_kg:.3f} kg ({mass_diff_pct:.2f}% diff)"
+            )
+    except Exception:
+        pass
+
+    body_params = {
+        "subject_name":   subject_name,
+        "href":           href,
+        "mass_kg":        mass_kg,
+        "height_m":       height_m,
+        "dof_names":      dof_names,
+        "marker_names":   marker_names,
+        "grf_bodies":     list(subject.getGroundForceBodies()),
+        # Fix 4: named dict instead of a flat uninterpretable list
+        "body_scales":    body_scales_dict,
+    }
+    if osim_mass_kg is not None:
+        body_params["osim_mass_kg"] = round(osim_mass_kg, 6)
 
     return dict(
         subject_name     = subject_name,
@@ -354,16 +427,61 @@ def process_trial(
         body_scales    = meta.get("body_scales_dict"),
         threshold_m    = qc_threshold_m,
     )
-    print(f"    flagged R: {qc['flagged_frame_count_r']:5d} / "
-          f"{qc['total_stance_frames_r']:5d} stance frames "
-          f"(max {qc['trial_max_distance_r']*100:.1f} cm, "
-          f"mean {qc['trial_mean_distance_r']*100:.1f} cm, "
-          f"median {qc['trial_median_distance_r']*100:.1f} cm)")
-    print(f"    flagged L: {qc['flagged_frame_count_l']:5d} / "
-          f"{qc['total_stance_frames_l']:5d} stance frames "
-          f"(max {qc['trial_max_distance_l']*100:.1f} cm, "
-          f"mean {qc['trial_mean_distance_l']*100:.1f} cm, "
-          f"median {qc['trial_median_distance_l']*100:.1f} cm)")
+    def _cop_temporal_bars(dist_list: list, threshold_m: float,
+                           t0: float, fs: float,
+                           n_bins: int = 10) -> tuple[str, str, str, str]:
+        """
+        Two temporal bar charts over trial time from per-frame distance data.
+
+        raw: per-bin mean CoP distance (cm), shared scale across R and L.
+        adj: per-bin excess above trial mean distance, clipped at 0.
+             Separate scale so small deviations stay visible.
+
+        Returns (t0_label, t1_label, raw_bar, adj_bar).
+        """
+        BAR = "▁▂▃▄▅▆▇█"
+        dist = np.array([v if v is not None else 0.0 for v in dist_list],
+                        dtype=float) * 100.0  # -> cm
+        T = len(dist)
+        edges = np.linspace(0, T, n_bins + 1).astype(int)
+        bin_means = [
+            float(np.mean(dist[edges[b]:edges[b+1]]))
+            if edges[b+1] > edges[b] else 0.0
+            for b in range(n_bins)
+        ]
+        trial_mean = float(np.mean(dist))
+        adj_bins   = [max(0.0, bm - trial_mean) for bm in bin_means]
+
+        def _bar(vals, ceil):
+            ceil = ceil or 1.0
+            return "".join(
+                BAR[min(int(v / ceil * (len(BAR) - 1)), len(BAR) - 1)]
+                for v in vals
+            )
+
+        raw_bar = _bar(bin_means, max(bin_means) or 1.0)
+        adj_bar = _bar(adj_bins,  max(adj_bins)  or 1.0)
+        t_start_label = f"{t0:.2f}s"
+        t_end_label   = f"{t0 + T / fs:.2f}s"
+        return t_start_label, t_end_label, raw_bar, adj_bar
+
+    for side, fr, tot, mx, mn, med, dist_key in [
+        ("R",
+         qc["flagged_frame_count_r"], qc["total_stance_frames_r"],
+         qc["trial_max_distance_r"],  qc["trial_mean_distance_r"],
+         qc["trial_median_distance_r"], "per_frame_distance_r"),
+        ("L",
+         qc["flagged_frame_count_l"], qc["total_stance_frames_l"],
+         qc["trial_max_distance_l"],  qc["trial_mean_distance_l"],
+         qc["trial_median_distance_l"], "per_frame_distance_l"),
+    ]:
+        t0_lbl, t1_lbl, raw_bar, adj_bar = _cop_temporal_bars(
+            qc[dist_key], qc_threshold_m, t0, fs
+        )
+        print(f"    flagged {side}: {fr:5d} / {tot:5d} stance frames | "
+              f"raw [{t0_lbl} {raw_bar} {t1_lbl}]  adj [{adj_bar}] | "
+              f"(max {mx*100:.1f} cm, mean {mn*100:.1f} cm, "
+              f"median {med*100:.1f} cm)")
 
     if qc_correct:
         grf, n_fixed = correct_cop_outliers(grf, qc, threshold_m=qc_threshold_m)
@@ -540,13 +658,48 @@ def process_subject(b3d_path: str, output_root: Path,
     if out_tag is None:
         out_tag = derive_dataset_tag(b3d_path)
     print(f"Tag     : {out_tag}")
+    log_fh = _start_extraction_log(Path(output_root), tag=out_tag)
 
     subject_out_dir = output_root / out_tag / meta["subject_name"]
     subject_out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Write shared .osim model once at the subject level
+    # Write shared .osim model once at the subject level.
+    # Fix 3: use ID_PASS_IDX (DYNAMICS pass) instead of pass 0 (KINEMATICS).
+    # AddBiomechanics finalises mass/inertia during the dynamics pass; pass 0
+    # may have stale segment masses. As a safety net, compare the summed body
+    # mass from each available pass against getMassKg() and prefer the closest.
+    declared_mass = subject.getMassKg()
+    best_pass = ID_PASS_IDX
+    best_diff = float("inf")
+    n_passes  = subject.getTrialNumProcessingPasses(0)
+    for p in range(n_passes):
+        try:
+            with suppress_native_stderr():
+                txt = subject.getOpensimFileText(p)
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(txt)
+            pass_mass = sum(
+                float(el.text.strip())
+                for el in root.iter("mass")
+            )
+            diff = abs(pass_mass - declared_mass)
+            if diff < best_diff:
+                best_diff  = diff
+                best_pass  = p
+        except Exception:
+            continue
+
+    if best_pass != ID_PASS_IDX:
+        print(
+            f"  [WARN] getOpensimFileText: pass {best_pass} has mass closest "
+            f"to getMassKg() ({declared_mass:.3f} kg); expected pass "
+            f"{ID_PASS_IDX}. Using pass {best_pass}."
+        )
+    else:
+        print(f"  [OK]   Using getOpensimFileText(pass {best_pass}) for .osim")
+
     with suppress_native_stderr():
-        osim_text = subject.getOpensimFileText(0)
+        osim_text = subject.getOpensimFileText(best_pass)
     osim_path = subject_out_dir / f"{meta['subject_name']}.osim"
     osim_path.write_text(osim_text)
     print(f"  [osim] model -> {osim_path}")
@@ -558,14 +711,32 @@ def process_subject(b3d_path: str, output_root: Path,
           f"correction={'ON' if qc_correct else 'OFF'}")
 
     # .trc output removed: AddBiomechanics-solved IK is the source of truth.
+    total_frames = 0
+    total_seconds = 0.0
     for trial_idx in trial_indices:
         trial_name = subject.getTrialName(trial_idx) or f"trial_{trial_idx:02d}"
         out_dir    = subject_out_dir / trial_name
+        nf = subject.getTrialLength(trial_idx)
+        dt = subject.getTrialTimestep(trial_idx)
+        total_frames  += nf
+        total_seconds += nf * dt if dt > 0 else nf / float(SAMPLE_RATE_HZ)
         with suppress_native_stderr():
             process_trial(subject, trial_idx, out_dir, meta)
 
     print(f"\n{'='*60}")
     print(f"Done. Outputs in: {subject_out_dir}/")
+    print(
+        f"Extracted: {len(trial_indices)} trials  |  "
+        f"{total_frames:,} frames  |  "
+        f"{total_seconds:.2f}s ({total_seconds/60:.2f} min)"
+    )
+    try:
+        log_fh.flush()
+        log_fh.close()
+        sys.stdout = sys.__stdout__
+        sys.stderr = sys.__stderr__
+    except Exception:
+        pass
 
 
 def _parse_args(argv: list[str] | None = None):
