@@ -8,12 +8,16 @@ Confirmed API against nimblephysics (Hammer2013 dataset, 3-pass B3D):
   Pass 1: LOW_PASS_FILTER  -- AddBiomechanics-filtered positions (used as IK source)
   Pass 2: DYNAMICS         -- joint moments (tau), used for ID output
 
-Outputs per trial (OUTPUT_ROOT / <subject_tag> / <trial_name> /):
+Outputs per trial (OUTPUT_ROOT / <dataset_tag> / <subject_tag> / <trial_name>/):
   ik.mot           -- IK joint angles (pass 1 pos + optional extra LPF), degrees
   id_moments.sto   -- ID joint moments from pass 2 tau, N·m
   grf.mot          -- bilateral GRF + CoP, single OpenSim 18-col layout
   grf_qc.json      -- per-trial CoP-foot alignment QC (always written)
   body.json        -- subject-level body parameters
+
+The <dataset_tag> is derived from the B3D path (e.g.
+'.../test/With_Arm/Carter2023_Formatted_With_Arm/...' -> 'Carter2023_test_arm')
+or set explicitly via --out-tag. Falls back to 'Other' if unparseable.
 
 Dependencies:
   pip install nimblephysics scipy numpy
@@ -31,6 +35,7 @@ CLI:
   python process_b3d.py -t 5 --qc-correct     # project flagged CoPs
   python process_b3d.py -t 5 --qc-threshold 0.05
 """
+from __future__ import annotations
 
 import os
 import sys
@@ -54,8 +59,8 @@ from b3d_grf_qc  import (
 # CONFIG: edit this block; leave everything else alone
 # ════════════════════════════════════════════════════════════════════════════
 
-B3D_PATH    = "AddBiomechanicsDataset/test/With_Arm/Carter2023_Formatted_With_Arm/P010_split0/P010_split0.b3d"
-OUTPUT_ROOT = "output/grf_qc"
+B3D_PATH    = "AddBiomechanicsDataset/train/No_Arm/Tan2021_Formatted_No_Arm/s1/s1.b3d"
+OUTPUT_ROOT = "output_exp"
 
 # Sampling rate (Hz). The actual per-trial timestep is read from the file;
 # SAMPLE_RATE_HZ is used only for filter design and as a fallback if
@@ -342,6 +347,72 @@ def process_trial(
     write_body_json(out_dir / "body.json", meta["body_params"])
 
 
+# ── Dataset tag derivation ────────────────────────────────────────────────────
+
+# Known AddBiomechanics dataset path layout:
+#   <root>/<split>/<arm_dir>/<study_dir>/<subject>/<subject>.b3d
+# where:
+#   split     in {"train", "test", "dev"}
+#   arm_dir   in {"With_Arm", "No_Arm"}
+#   study_dir is the source-paper folder, often suffixed with "_Formatted"
+#             and/or "_With_Arm" / "_No_Arm". Examples seen:
+#               Carter2023_Formatted_With_Arm
+#               Camargo2021_Formatted_No_Arm
+#               Hammer2013_Formatted
+#               Falisse2017
+#
+# Output tag rule:
+#   <study_short>_<split>_<arm_short>
+# where:
+#   study_short = study_dir with "_Formatted", "_With_Arm", "_No_Arm" stripped
+#   arm_short   = "arm" | "noarm"
+#
+# Examples:
+#   .../test/With_Arm/Carter2023_Formatted_With_Arm/...    -> Carter2023_test_arm
+#   .../train/No_Arm/Camargo2021_Formatted_No_Arm/...      -> Camargo2021_train_noarm
+#   .../dev/With_Arm/Falisse2017/...                       -> Falisse2017_dev_arm
+#
+# If the path doesn't conform, returns "Other".
+
+_KNOWN_SPLITS    = {"train", "test", "dev", "val", "validation"}
+_KNOWN_ARM_DIRS  = {"With_Arm": "arm", "No_Arm": "noarm"}
+_STUDY_SUFFIXES  = ("_Formatted_With_Arm", "_Formatted_No_Arm",
+                    "_With_Arm", "_No_Arm", "_Formatted")
+
+
+def derive_dataset_tag(b3d_path: str) -> str:
+    """
+    Derive a short dataset tag from an AddBiomechanics-style B3D path.
+    Returns 'Other' on any parse failure.
+    """
+    parts = Path(b3d_path).parts
+    # Walk backwards from the file looking for split + arm anchor pair.
+    # Expected layout: ... split / arm_dir / study_dir / subject / file.b3d
+    # So if file is at index -1, study_dir at -3, arm_dir at -4, split at -5.
+    if len(parts) < 5:
+        return "Other"
+    try:
+        split   = parts[-5]
+        arm_dir = parts[-4]
+        study   = parts[-3]
+    except IndexError:
+        return "Other"
+
+    if split not in _KNOWN_SPLITS or arm_dir not in _KNOWN_ARM_DIRS:
+        return "Other"
+
+    study_short = study
+    for suf in _STUDY_SUFFIXES:
+        if study_short.endswith(suf):
+            study_short = study_short[: -len(suf)]
+            break
+
+    if not study_short:
+        return "Other"
+
+    return f"{study_short}_{split}_{_KNOWN_ARM_DIRS[arm_dir]}"
+
+
 # ── Top-level entry point ─────────────────────────────────────────────────────
 
 def _resolve_trial_selection(subject, trials: list | None) -> list[int]:
@@ -396,7 +467,8 @@ def process_subject(b3d_path: str, output_root: Path,
                     trials: list | None = None,
                     list_only: bool = False,
                     qc_threshold_m: float = 0.03,
-                    qc_correct: bool = False) -> None:
+                    qc_correct: bool = False,
+                    out_tag: str | None = None) -> None:
     """
     Parameters
     ----------
@@ -412,6 +484,10 @@ def process_subject(b3d_path: str, output_root: Path,
     qc_correct     : if True, project flagged CoPs onto the foot polygon
                      before writing grf.mot. Force vector and free torque
                      are not modified.
+    out_tag        : dataset tag used as a sub-directory of output_root.
+                     If None, derive_dataset_tag(b3d_path) is called; the
+                     parser returns "Other" on unrecognised path layouts.
+                     Final output dir is: output_root / out_tag / subject_name
     """
     print(f"\n{'='*60}")
     print(f"Loading : {b3d_path}")
@@ -425,7 +501,11 @@ def process_subject(b3d_path: str, output_root: Path,
     meta["qc_threshold_m"] = qc_threshold_m
     meta["qc_correct"]     = qc_correct
 
-    subject_out_dir = output_root / meta["subject_name"]
+    if out_tag is None:
+        out_tag = derive_dataset_tag(b3d_path)
+    print(f"Tag     : {out_tag}")
+
+    subject_out_dir = output_root / out_tag / meta["subject_name"]
     subject_out_dir.mkdir(parents=True, exist_ok=True)
 
     # Write shared .osim model once at the subject level
@@ -447,7 +527,7 @@ def process_subject(b3d_path: str, output_root: Path,
         process_trial(subject, trial_idx, out_dir, meta)
 
     print(f"\n{'='*60}")
-    print(f"Done. Outputs in: {output_root / meta['subject_name']}/")
+    print(f"Done. Outputs in: {subject_out_dir}/")
 
 
 def _parse_args(argv: list[str] | None = None):
@@ -485,6 +565,12 @@ Examples:
                    help="If set, project flagged CoPs onto the foot polygon "
                         "before writing grf.mot. Force vector and free "
                         "torque are not modified.")
+    p.add_argument("--out-tag", default=None, metavar="TAG",
+                   help="Dataset tag used as a subfolder of --out. If "
+                        "omitted, derived from the B3D path "
+                        "(e.g. '.../test/With_Arm/Carter2023_Formatted_With_Arm/...' "
+                        "-> 'Carter2023_test_arm'). Falls back to 'Other' "
+                        "on unrecognised paths.")
     return p.parse_args(argv)
 
 
@@ -497,4 +583,5 @@ if __name__ == "__main__":
         list_only      = args.list_only,
         qc_threshold_m = args.qc_threshold,
         qc_correct     = args.qc_correct,
+        out_tag        = args.out_tag,
     )
