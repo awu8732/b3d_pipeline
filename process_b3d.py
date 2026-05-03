@@ -126,7 +126,7 @@ def suppress_native_stderr():
 # CONFIG: edit this block; leave everything else alone
 # ════════════════════════════════════════════════════════════════════════════
 
-B3D_PATH    = "AddBiomechanicsDataset/test/With_Arm/Carter2023_Formatted_With_Arm/P010_split0/P010_split0.b3d"
+B3D_PATH    = "AddBiomechanicsDataset/train/No_Arm/Tan2022_Formatted_No_Arm/06/06.b3d"
 OUTPUT_ROOT = "output_exp"
 
 # Sampling rate (Hz). The actual per-trial timestep is read from the file;
